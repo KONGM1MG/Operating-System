@@ -4,7 +4,7 @@
 # void switch_to(struct proc_struct* from, struct proc_struct* to)
 .globl switch_to
 switch_to:
-    # save from's registers
+    # save from's registers 从from进程保存寄存器
     STORE ra, 0*REGBYTES(a0)
     STORE sp, 1*REGBYTES(a0)
     STORE s0, 2*REGBYTES(a0)
@@ -20,7 +20,7 @@ switch_to:
     STORE s10, 12*REGBYTES(a0)
     STORE s11, 13*REGBYTES(a0)
 
-    # restore to's registers
+    # restore to's registers 从to进程恢复寄存器
     LOAD ra, 0*REGBYTES(a1)
     LOAD sp, 1*REGBYTES(a1)
     LOAD s0, 2*REGBYTES(a1)

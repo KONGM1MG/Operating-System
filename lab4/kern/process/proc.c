@@ -79,13 +79,13 @@ struct proc_struct *current = NULL;     // 当前占用 CPU 且处于“运行�
                                         // 并且整个切换和修改过程需要保证操作的原子性，目前至少需要屏蔽中断。可以参考switch_to的实现。
 
 
-static int nr_process = 0;
+static int nr_process = 0;  // 当前进程数目
 
 void kernel_thread_entry(void);
 void forkrets(struct trapframe *tf);
 void switch_to(struct context *from, struct context *to);
 
-// alloc_proc - alloc a proc_struct and init all fields of proc_struct 翻译：
+// alloc_proc - alloc a proc_struct and init all fields of proc_struct 翻译：建立进程控制块
 static struct proc_struct *
 alloc_proc(void) {
     struct proc_struct *proc = kmalloc(sizeof(struct proc_struct));
@@ -106,8 +106,18 @@ alloc_proc(void) {
      *       uint32_t flags;                             // Process flag
      *       char name[PROC_NAME_LEN + 1];               // Process name
      */
-
-
+    proc->state = PROC_UNINIT;  // 设置进程状态为未初始化
+    proc->pid = -1; // 进程 ID
+    proc->runs = 0; // 进程运行次数
+    proc->kstack = 0;   // 进程内核栈
+    proc->need_resched = 0; // 是否需要重新调度
+    proc->parent = NULL;    // 父进程
+    proc->mm = NULL;    // 进程所用的虚拟内存
+    memset(&(proc->context), 0, sizeof(struct context)); // 进程的上下文
+    proc->tf = NULL; // 中断帧指针
+    proc->cr3 = boot_cr3; // 页目录表地址 设为 内核页目录表基址
+    proc->flags = 0; // 标志位
+    memset(&(proc->name), 0, PROC_NAME_LEN); // 进程名
     }
     return proc;
 }
@@ -176,7 +186,17 @@ proc_run(struct proc_struct *proc) {
         *   lcr3():                   Modify the value of CR3 register
         *   switch_to():              Context switching between two processes
         */
-       
+        bool intr_flag;
+        struct proc_struct *prev = current, *next = proc;
+        local_intr_save(intr_flag); // 关闭中断
+        {
+            current = proc; // 将当前进程换为 要切换到的进程
+            // 设置任务状态段tss中的特权级0下的 esp0 指针为 next 内核线程 的内核栈的栈顶
+            // load_esp0(next->kstack + KSTACKSIZE);
+            lcr3(next->cr3); // 重新加载 cr3 寄存器(页目录表基址) 进行进程间的页表切换
+            switch_to(&(prev->context), &(next->context)); // 调用 switch_to 进行上下文的保存与切换
+        }
+        local_intr_restore(intr_flag);
     }
 }
 
@@ -212,14 +232,25 @@ find_proc(int pid) {
 // kernel_thread - create a kernel thread using "fn" function
 // NOTE: the contents of temp trapframe tf will be copied to 
 //       proc->tf in do_fork-->copy_thread function
+// 创建内核线程，kernel_thread 函数采用了局部变量 tf 来放置保存内核线程的临时中断帧，并把中断帧的指针传递给
+// do_fork 函数，而 do_fork 函数会调用 copy_thread 函数来在新创建的进程内核栈上专门给进程的中断帧分配
+// 一块空间。
 int
 kernel_thread(int (*fn)(void *), void *arg, uint32_t clone_flags) {
+    // 对trameframe， 也就是我们程序的一些上下文进行一些初始化
     struct trapframe tf;
     memset(&tf, 0, sizeof(struct trapframe));
-    tf.gpr.s0 = (uintptr_t)fn;
-    tf.gpr.s1 = (uintptr_t)arg;
+    // 设置内核线程的参数和函数指针
+    tf.gpr.s0 = (uintptr_t)fn;  // s0寄存器存储函数指针
+    tf.gpr.s1 = (uintptr_t)arg; // s1寄存器存储函数参数
+    // 设置trapframe的status寄存器
+    // SSTATUS_SPP: Previous Privilege mode, 1=Supervisor, 0=User 设置为supervisor，因为这是一个内核线程
+    // SSTATUS_SPIE: Supervisor Previous Interrupt Enable 设置为启用中断，因为这是一个内核线程
+    // SSTATUS_SIE: Supervisor Interrupt Enable 设置为0，禁止中断，不希望线程被中断
     tf.status = (read_csr(sstatus) | SSTATUS_SPP | SSTATUS_SPIE) & ~SSTATUS_SIE;
+    // 将入口点epc设置为kernel_thread_entry，实际上是将pc指向它（*trapentry.S）
     tf.epc = (uintptr_t)kernel_thread_entry;
+    // 使用do_fork函数创建内核线程，这样才真正用设置的tf创建新线程
     return do_fork(clone_flags | CLONE_VM, 0, &tf);
 }
 
@@ -253,13 +284,15 @@ copy_mm(uint32_t clone_flags, struct proc_struct *proc) {
 //             - setup the kernel entry point and stack of process
 static void
 copy_thread(struct proc_struct *proc, uintptr_t esp, struct trapframe *tf) {
+    // 先在上面分配的内核栈上分配出一片空间来保存trapframe
     proc->tf = (struct trapframe *)(proc->kstack + KSTACKSIZE - sizeof(struct trapframe));
     *(proc->tf) = *tf;
 
     // Set a0 to 0 so a child process knows it's just forked
+    // trapframe中的a0寄存器（返回值）设置为0，说明这个进程是一个子进程
     proc->tf->gpr.a0 = 0;
     proc->tf->gpr.sp = (esp == 0) ? (uintptr_t)proc->tf : esp;
-
+    // 们将上下文中的 ra 设置为了forkret 函数的入口，并且把 trapframe 放在上下文的栈顶
     proc->context.ra = (uintptr_t)forkret;
     proc->context.sp = (uintptr_t)(proc->tf);
 }
@@ -303,7 +336,23 @@ do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf) {
     //    6. call wakeup_proc to make the new child process RUNNABLE
     //    7. set ret vaule using child proc's pid
 
+    if ((proc = alloc_proc()) == NULL)  // 分配并初始化进程控制块
+    	goto fork_out;    
+    if (setup_kstack(proc) != 0)    // 分配并初始化内核栈
+    	goto bad_fork_cleanup_proc;
+    if (copy_mm(clone_flags, proc) != 0)    // 根据 clone_flags 决定是复制还是共享内存管理系统（copy_mm 函数）
+    	goto bad_fork_cleanup_kstack;    
+    copy_thread(proc, stack, tf);   // 复制父进程的中断帧和上下文，设置子进程的中断帧和上下文
+    proc->pid = get_pid();  // 分配进程 ID
+    nr_process++;   // 进程数加一
+    hash_proc(proc);    // 将进程控制块链接到哈希表中
+    list_add_before(&proc_list, &proc->list_link);  // 将进程控制块链接到进程控制块链表中
+    wakeup_proc(proc);  // 将进程状态设置为 PROC_RUNNABLE，表示进程可以运行
+    ret = proc->pid;    // 返回子进程的进程 ID
     
+    // 如果上述前 3 步执行没有成功，则需要做对应的出错处理，把相关已经占有的内存释
+    // 放掉。copy_mm 函数目前只是把 current->mm 设置为 NULL，这是由于目前在实验四中只能创建内核线程，
+    // proc->mm 描述的是进程用户态空间的情况，所以目前 mm 还用不上。
 
 fork_out:
     return ret;
@@ -366,10 +415,10 @@ proc_init(void) {
 
     }
     
-    idleproc->pid = 0;
-    idleproc->state = PROC_RUNNABLE;
-    idleproc->kstack = (uintptr_t)bootstack;
-    idleproc->need_resched = 1;
+    idleproc->pid = 0;  // idleproc的合法的pid为0
+    idleproc->state = PROC_RUNNABLE;    // 设置进程状态为可运行
+    idleproc->kstack = (uintptr_t)bootstack;    // 设置内核栈起始地址，以后的其他线程的内核栈需要分配获得
+    idleproc->need_resched = 1; // 设置需要重新调度，希望CPU应该做更有用的工作，而不是运行idleproc
     set_proc_name(idleproc, "idle");
     nr_process ++;
 
@@ -388,11 +437,12 @@ proc_init(void) {
 }
 
 // cpu_idle - at the end of kern_init, the first kernel thread idleproc will do below works
+// idle线程最终会执行cpu_idle函数，该函数的作用是让CPU空闲下来，等待中断的到来。
 void
 cpu_idle(void) {
-    while (1) {
+    while (1) { // 判断当前内核线程 idleproc 的 need_resched 是否不为 0
         if (current->need_resched) {
-            schedule();
+            schedule(); //调用schedule函数找其他处于“就绪”态的进程执行。
         }
     }
 }

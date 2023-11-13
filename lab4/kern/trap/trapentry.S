@@ -112,5 +112,5 @@ __trapret:
     .globl forkrets
 forkrets:
     # set stack to this new process's trapframe
-    move sp, a0
+    move sp, a0 # 将进程的中断帧地址放入sp，这样在 __trapret 中就可以直接从中断帧里面恢复所有的寄存器
     j __trapret
