@@ -138,34 +138,35 @@ get_proc_name(struct proc_struct *proc) {
 }
 
 // get_pid - alloc a unique pid for process
+// 通过递增last_pid并遍历进程链表来查找未被使用的ID。函数保证了分配的ID在有效范围内（1到MAX_PID - 1）。
 static int
 get_pid(void) {
-    static_assert(MAX_PID > MAX_PROCESS);
+    static_assert(MAX_PID > MAX_PROCESS);   // 静态检查
     struct proc_struct *proc;
     list_entry_t *list = &proc_list, *le;
-    static int next_safe = MAX_PID, last_pid = MAX_PID;
-    if (++ last_pid >= MAX_PID) {
+    static int next_safe = MAX_PID, last_pid = MAX_PID; // next_safe 表示下一个安全的进程 ID，last_pid 表示最后一个进程 ID
+    if (++ last_pid >= MAX_PID) {   // 如果 last_pid+1 大于等于最大进程 ID，那么将 last_pid 设为 1
         last_pid = 1;
         goto inside;
     }
     if (last_pid >= next_safe) {
-    inside:
+    inside: // 如果 last_pid 大于等于 next_safe，那么需要重新遍历进程控制块链表，找到一个没有被占用的进程 ID
         next_safe = MAX_PID;
-    repeat:
+    repeat: // 重新遍历进程控制块链表
         le = list;
         while ((le = list_next(le)) != list) {
-            proc = le2proc(le, list_link);
-            if (proc->pid == last_pid) {
-                if (++ last_pid >= next_safe) {
-                    if (last_pid >= MAX_PID) {
+            proc = le2proc(le, list_link);  // 获取进程控制块
+            if (proc->pid == last_pid) {    // 如果进程控制块的进程 ID 等于 last_pid
+                if (++ last_pid >= next_safe) { // 如果 last_pid 大于等于 next_safe
+                    if (last_pid >= MAX_PID) {  // 如果 last_pid 大于等于最大进程 ID，那么将 last_pid 设为 1
                         last_pid = 1;
                     }
-                    next_safe = MAX_PID;
-                    goto repeat;
+                    next_safe = MAX_PID;    // 将 next_safe 设为最大进程 ID
+                    goto repeat;    // 重新遍历进程控制块链表
                 }
             }
-            else if (proc->pid > last_pid && next_safe > proc->pid) {
-                next_safe = proc->pid;
+            else if (proc->pid > last_pid && next_safe > proc->pid) {   // 如果进程控制块的进程 ID 大于 last_pid 且小于 next_safe
+                next_safe = proc->pid;  // 将 next_safe 设为进程控制块的进程 ID
             }
         }
     }
